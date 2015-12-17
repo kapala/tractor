@@ -28,6 +28,8 @@ from astrometry.util.miscutils import point_in_poly
 import multiprocessing
 import os
 
+from scipy.integrate import simps, cumtrapz
+from itertools import izip
 
 class Physics(object):
     # all the following from physics.nist.gov
@@ -96,7 +98,7 @@ class Physics(object):
         return d_black_body_nu_d_lnT(lam, lnT)
 
 class DustPhotoCal(ParamList):
-    def __init__(self, lam, pixscale):
+    def __init__(self, lam, lams, transmissions, pixscale):
         '''
         lam: central wavelength of filter in microns
 
@@ -115,23 +117,28 @@ class DustPhotoCal(ParamList):
 
         '''
         self.lam = lam
+        self.lams = lams
+        self.transmissions = transmissions
         self.cal = 1e20
         # No (adjustable) params
         super(DustPhotoCal,self).__init__()
 
-
     # MAGIC number: wavelength scale for emissivity model
     lam0 = 1.e-4 # m
+
+    def dustParamsToCountsPerElement(self, logsolidangle, logtemperature, beta):
+        modifiedBlackBody = np.exp(logsolidangle) * ((self.lams / DustPhotoCal.lam0) ** (-1. * beta)) * Physics.black_body_nu(self.lams, logtemperature) * self.cal
+        original = np.exp(logsolidangle) * ((self.lam / DustPhotoCal.lam0) ** (-1. * beta)) * Physics.black_body_nu(self.lam, logtemperature) * self.cal
+
+        return_val = simps(modifiedBlackBody * self.transmissions, self.lams)
+        return return_val * 10e4 # magic number to keep the same order of magnitude as before
 
     def dustParamsToCounts(self, logsolidangle, logtemperature, emissivity):
         # see, eg, http://arxiv.org/abs/astro-ph/9902255 for (lam/lam0) ^ -beta
         beta = np.array(emissivity)
-        return(
-            np.exp(logsolidangle)
-            * ((self.lam / DustPhotoCal.lam0) ** (-1. * beta))
-            * Physics.black_body_nu(self.lam, logtemperature)
-            * self.cal)
-        
+
+        return np.array(map(lambda (sa, temp, em): self.dustParamsToCountsPerElement(sa, temp, em), zip(logsolidangle, logtemperature, beta)))
+
     def brightnessToCounts(self, brightness):
         return self.dustParamsToCounts(brightness.logsolidangle,
                                        brightness.logtemperature,
@@ -590,7 +597,7 @@ class DustSheet(MultiParams):
                 step = ss[i0+parami]
                 args = [sa[gridi], t[gridi], e[gridi]]
                 args[si] += step
-                countsi = photocal.dustParamsToCounts(*args)
+                countsi = photocal.dustParamsToCounts([args[0]], [args[1]], [args[2]])
                 dc = (countsi - counts0[gridi])
                 dmod = np.zeros(nzshape)
                 dmod.ravel()[NZI] = dc * V * (cscale / step)
@@ -869,11 +876,11 @@ def create_tractor(opt):
     - Can I just blow up the SPIRE images with interpolation?
     """
     dataList = [
-        ('m31_brick15_PACS100.fits',  'PACS 100',  7.23,  7.7),
-        ('m31_brick15_PACS160.fits',  'PACS 160',  3.71, 12.0),
-        ('m31_brick15_SPIRE250.fits', 'SPIRE 250', None, 18.0),
-        ('m31_brick15_SPIRE350.fits', 'SPIRE 350', None, 25.0),
-        ('m31_brick15_SPIRE500.fits', 'SPIRE 500', None, 37.0),
+        ('m31_brick15_PACS100.fits',  'PACS 100',  7.23,  7.7, 'P100_filt_custom.txt'),
+        ('m31_brick15_PACS160.fits',  'PACS 160',  3.71, 12.0, 'P160_filt_custom.txt'),
+        ('m31_brick15_SPIRE250.fits', 'SPIRE 250', None, 18.0, 'S250_filt_custom.txt'),
+        ('m31_brick15_SPIRE350.fits', 'SPIRE 350', None, 25.0, 'S350_filt_custom.txt'),
+        ('m31_brick15_SPIRE500.fits', 'SPIRE 500', None, 37.0, 'S500_filt_custom.txt'),
         ]
 
     # From Groves via Rix:
@@ -888,7 +895,7 @@ def create_tractor(opt):
 
     print 'Reading images...'
     tims = []
-    for i, (fn, nm, noise, fwhm) in enumerate(dataList):
+    for i, (fn, nm, noise, fwhm, transmissionFileName) in enumerate(dataList):
         print
         print 'Reading', fn
         P = pyfits.open(fn)
@@ -914,7 +921,10 @@ def create_tractor(opt):
         # calibrated, yo
         assert(hdr['BUNIT'] == 'MJy/Sr')
         # "Filter" is in *microns* in the headers; convert to *m* here, to match "lam0"
-        pcal = DustPhotoCal(lam * 1e-6, wcs.pixel_scale())
+
+        lams, transmissions = np.loadtxt(transmissionFileName, usecols=(0,1), unpack=True)
+
+        pcal = DustPhotoCal(lam * 1e-6, lams * 1e-6, transmissions, wcs.pixel_scale())
         #nm = '%s %i' % (hdr['INSTRUME'], lam)
         #nm = fn.replace('.fits', '')
         #zr = noise * np.array([-3, 10]) + skyval
